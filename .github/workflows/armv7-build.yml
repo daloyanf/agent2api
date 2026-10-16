@@ -1,0 +1,151 @@
+name: armv7-build
+
+# 玩客云（S805 / armv7）专用：同步上游 + 交叉编译 agent2api-server。
+#
+# 背景：上游 aimod-cc/agent2api 只发 amd64 / arm64（macOS/Windows 安装包与
+# Docker 镜像），玩客云需要的 armv7 由本 fork 自己补。本文件是 fork 独有资产
+# （上游没有这个路径），因此它可以安全地长期驻留在 main 上。
+#
+# 为什么把「同步上游」也放进本工作流：
+#   2026-10-15 用 GitHub 网页的 Sync fork（丢弃提交式）同步 v3.0.6 时，把 fork
+#   上的本文件一并冲掉了，导致没有可派发的 armv7 构建。现在 fork main 固定为
+#   同一形态：「上游提交 + 仅保留本文件（其余上游工作流一律剥离）」——
+#     1) 手动派发本工作流（默认勾选「先同步上游」）——清点式同步与编译一次完成；
+#     2) GCP github-sync（每 6 小时）按 keep-list 同步成同一形态，push 事件
+#        （上游经合并/推送进 main 时）也会自动触发编译。
+#   两条路都不会删本文件；若仍有人用「丢弃提交」方式把它删掉，GCP 端的本地
+#   规范副本会自动补回，手工恢复办法见备份仓库 玩客云/services/agent2api/ci/README.md。
+#
+# 交叉编译：cross-rs v0.2.5（Docker 化工具链，含 arm musl 交叉 gcc），目标
+# armv7-unknown-linux-musleabihf（musl 全静态，无运行时共享库依赖）。加密栈
+# rustls/ring 的 C/汇编、rusqlite bundled SQLite 的 C 代码，都由容器内交叉
+# gcc 编译。只编 -p agent2api-server（headless 网关本体），源码零改动。
+# 产物布局与官方 Docker 镜像一致：agent2api-server + ui/。
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: 先同步上游 aimod-cc/agent2api 到 main，再编译
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+    # 纯文档 / CI 文件自身的改动不触发编译
+    paths-ignore:
+      - ".github/**"
+      - "**/*.md"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要完整历史做 merge 判断
+          fetch-depth: 0
+
+      - name: 同步上游到 fork main（清点式：上游提交 + 仅保留本工作流）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sync_upstream }}
+        run: |
+          set -euo pipefail
+          git config user.name "wky-armv7-ci"
+          git config user.email "wky-armv7-ci@users.noreply.github.com"
+          git remote add upstream https://github.com/aimod-cc/agent2api.git 2>/dev/null || true
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse upstream/main)"
+          old_tree="$(git rev-parse origin/main^{tree})"
+          KEEP="$(mktemp -d)"
+          cp .github/workflows/armv7-build.yml "$KEEP/armv7-build.yml"
+          # 与 GCP github-sync 保持同一形态：上游提交 + 仅保留本文件（其余上游
+          # 工作流一律剥离，fork 里不跑上游 CI）。树比对决定是否需要推送 ——
+          # 形态已一致时零动作，绝不产生无意义提交。
+          git reset --hard -q "$upstream_sha"
+          rm -rf .github/workflows
+          mkdir -p .github/workflows
+          cp "$KEEP/armv7-build.yml" .github/workflows/armv7-build.yml
+          git add -A
+          new_tree="$(git write-tree)"
+          if [ "$old_tree" = "$new_tree" ]; then
+            echo "fork main 已是目标形态（上游 $upstream_sha），无需推送"
+            exit 0
+          fi
+          git commit -q -m "sync: 镜像上游 ${upstream_sha:0:7}（剥离上游工作流，保留 armv7-build.yml）"
+          git push --force origin HEAD:main
+          echo "已更新 fork main: $(git rev-parse HEAD)"
+
+      - name: 读取版本号
+        id: ver
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -nE 's/^version = "(.*)"/\1/p' desktop-tauri/src-tauri/server/Cargo.toml | head -1)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "构建版本: $VERSION（commit $(git rev-parse --short HEAD)）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 停用上游自带工作流（fork 只保留 armv7-build）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          R="${GITHUB_REPOSITORY}"
+          # 上游自带的工作流在 fork 里没有价值（耗 runner、失败还发告警邮件）；
+          # 本仓库保留其文件只为避免与上游 merge 冲突，但每次同步后统一停用，
+          # 本仓库自己的 armv7-build 保持启用。（其余 fork 由 GCP github-sync
+          # 直接剥离 .github/workflows，不在这里处理。）
+          # 注意：必须用数字 id + REST 接口 —— gh workflow disable 按「名字」在
+          # 已禁用的工作流里解析不到（2026-10-16 实测 "could not find any
+          # workflows named build"）。
+          gh workflow list -R "$R" --all --json id,name,state \
+            --jq '.[] | select(.name != "armv7-build") | select(.state != "disabled_manually") | "\(.id) \(.name)"' \
+            | while read -r wid wname; do
+                [ -n "${wid:-}" ] || continue
+                if gh api -X PUT "/repos/$R/actions/workflows/$wid/disable" >/dev/null 2>&1; then
+                  echo "已停用: $wname (id=$wid)"
+                else
+                  echo "停用失败（忽略）: $wname (id=$wid)"
+                fi
+              done
+
+      - name: Install cross (prebuilt binary)
+        run: |
+          curl -sSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv cross /usr/local/bin/cross
+          cross --version
+
+      - name: Build agent2api-server (armv7 musl static via cross)
+        working-directory: desktop-tauri/src-tauri
+        run: |
+          cross build --release -p agent2api-server --target armv7-unknown-linux-musleabihf --target-dir "${{ github.workspace }}/target"
+          file "${{ github.workspace }}/target/armv7-unknown-linux-musleabihf/release/agent2api-server"
+
+      - name: Stage artifact (server + ui panel)
+        run: |
+          set -euo pipefail
+          mkdir -p stage/ui
+          cp "${{ github.workspace }}/target/armv7-unknown-linux-musleabihf/release/agent2api-server" stage/
+          cp -r desktop-tauri/ui/. stage/ui/
+          tar -czf "agent2api-armv7-v${VERSION}.tar.gz" -C stage .
+          sha256sum "agent2api-armv7-v${VERSION}.tar.gz" > "agent2api-armv7-v${VERSION}.tar.gz.sha256"
+          {
+            echo "version: ${VERSION}"
+            echo "fork_main_commit: $(git rev-parse HEAD)"
+            echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > BUILD-INFO.txt
+          ls -la "agent2api-armv7-v${VERSION}.tar.gz"
+          cat BUILD-INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-armv7-v${{ env.VERSION }}
+          path: |
+            agent2api-armv7-v${{ env.VERSION }}.tar.gz
+            agent2api-armv7-v${{ env.VERSION }}.tar.gz.sha256
+            BUILD-INFO.txt
+          retention-days: 90
+          if-no-files-found: error
